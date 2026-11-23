@@ -1,0 +1,29 @@
+#include <winver.h>
+#include "version.h"
+
+1 ICON "StlQuickView.ico"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION STLQV_VERSION_COMMA
+PRODUCTVERSION STLQV_VERSION_COMMA
+FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+FILEFLAGS 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription", "STL Quick View"
+            VALUE "FileVersion", STLQV_VERSION_STR
+            VALUE "OriginalFilename", "StlQuickView.exe"
+            VALUE "ProductName", "STL Quick View"
+            VALUE "ProductVersion", STLQV_VERSION_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END
