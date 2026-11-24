@@ -163,7 +163,7 @@ public:
         context->ClearDepthStencilView(depthView.Get(), D3D11_CLEAR_DEPTH, 1, 0);
 
         FrameConstants frame{};
-        ViewMatrices(scene.view, width, height, frame.rotation, frame.transform);
+        SceneMatrices(scene, frame.rotation, frame.transform);
 
         // Backdrop: two triangles straight in clip space.
         float top[3], bottom[3];

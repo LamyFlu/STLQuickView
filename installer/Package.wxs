@@ -47,9 +47,29 @@
             <RegistrySearch Id="ExistingMachineStlPreview" Root="HKLM" Key="$(PreviewBinding)"
                             Type="raw" Bitness="always64" />
         </Property>
+        <!-- Preview pane for 3MF / OBJ / PLY, bound on the per-user extension key so it applies
+             whatever app opens the file. Only claimed when free or already ours; uninstalling
+             falls back to Windows' own 3MF preview. -->
+        <?define Preview3mfBinding = Software\Classes\.3mf\ShellEx\$(PreviewType) ?>
+        <?define PreviewObjBinding = Software\Classes\.obj\ShellEx\$(PreviewType) ?>
+        <?define PreviewPlyBinding = Software\Classes\.ply\ShellEx\$(PreviewType) ?>
+        <Property Id="EXISTING_USER_3MF_PREVIEW">
+            <RegistrySearch Id="ExistingUser3mfPreview" Root="HKCU" Key="$(Preview3mfBinding)" Type="raw" Bitness="always64" />
+        </Property>
+        <Property Id="EXISTING_USER_OBJ_PREVIEW">
+            <RegistrySearch Id="ExistingUserObjPreview" Root="HKCU" Key="$(PreviewObjBinding)" Type="raw" Bitness="always64" />
+        </Property>
+        <Property Id="EXISTING_USER_PLY_PREVIEW">
+            <RegistrySearch Id="ExistingUserPlyPreview" Root="HKCU" Key="$(PreviewPlyBinding)" Type="raw" Bitness="always64" />
+        </Property>
         <Property Id="EXISTING_USER_3MF_THUMBNAIL">
             <RegistrySearch Id="ExistingUser3mfThumbnail" Root="HKCU" Key="$(PlateThumbnailBinding)"
                             Type="raw" Bitness="always64" />
+        </Property>
+        <!-- Install location: chosen on the welcome page for a new install, remembered for upgrades. -->
+        <Property Id="INSTALLFOLDER">
+            <RegistrySearch Id="PreviousInstallFolder" Root="HKCU" Key="Software\StlQuickView\Installer"
+                            Name="InstallFolder" Type="raw" Bitness="always64" />
         </Property>
         <Launch Condition='Installed OR WIX_UPGRADE_DETECTED OR NOT EXISTING_PREVIEW_SERVER'
                 Message="請先以原先的 Setup.ps1 加上 -Uninstall 移除舊版檔案總管整合，再執行 MSI。" />
@@ -65,6 +85,8 @@
                         <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
                         <RegistryValue Root="HKCU" Key="Software\StlQuickView\Installer"
                                        Name="Engine" Value="MSI" Type="string" KeyPath="yes" />
+                        <RegistryValue Root="HKCU" Key="Software\StlQuickView\Installer"
+                                       Name="InstallFolder" Value="[INSTALLFOLDER]" Type="string" />
                         <RegistryKey Root="HKCU" Key="Software\Classes\$(ProgId)">
                             <RegistryValue Value="STL 3D 模型" Type="string" />
                             <RegistryValue Key="DefaultIcon" Value="&quot;[#ViewerExe]&quot;,0" Type="string" />
@@ -138,6 +160,18 @@
                         <RegistryValue Root="HKCU" Key="Software\Classes\CLSID\$(PlateThumbnail)" Value="STL Quick View 3MF Plate Thumbnail" Type="string" />
                         <RegistryValue Root="HKCU" Key="$(PlateThumbnailBinding)" Value="$(PlateThumbnail)" Type="string" />
                     </Component>
+                    <Component Id="Preview3mf" Guid="{6B0E3F2A-51C4-4D8B-9E37-2A1C5F8D9B40}"
+                               Condition='NOT EXISTING_USER_3MF_PREVIEW OR EXISTING_USER_3MF_PREVIEW ~= "$(Preview)"'>
+                        <RegistryValue Root="HKCU" Key="$(Preview3mfBinding)" Value="$(Preview)" Type="string" KeyPath="yes" />
+                    </Component>
+                    <Component Id="PreviewObj" Guid="{0D7A2C19-8E45-4F36-B1A2-7C9E3D5F1A62}"
+                               Condition='NOT EXISTING_USER_OBJ_PREVIEW OR EXISTING_USER_OBJ_PREVIEW ~= "$(Preview)"'>
+                        <RegistryValue Root="HKCU" Key="$(PreviewObjBinding)" Value="$(Preview)" Type="string" KeyPath="yes" />
+                    </Component>
+                    <Component Id="PreviewPly" Guid="{A4C81E5D-3B27-4F9A-8D16-5E2B7C4A9F83}"
+                               Condition='NOT EXISTING_USER_PLY_PREVIEW OR EXISTING_USER_PLY_PREVIEW ~= "$(Preview)"'>
+                        <RegistryValue Root="HKCU" Key="$(PreviewPlyBinding)" Value="$(Preview)" Type="string" KeyPath="yes" />
+                    </Component>
                 </Directory>
         </StandardDirectory>
         <StandardDirectory Id="ProgramMenuFolder" />
@@ -148,6 +182,9 @@
             <ComponentRef Id="ExplorerPreview" />
             <ComponentRef Id="ExplorerThumbnail" />
             <ComponentRef Id="ExplorerPlateThumbnail" />
+            <ComponentRef Id="Preview3mf" />
+            <ComponentRef Id="PreviewObj" />
+            <ComponentRef Id="PreviewPly" />
         </Feature>
 
         <Binary Id="InstallerActions" SourceFile="build\StlQuickViewInstallerActions.dll" />
@@ -176,6 +213,7 @@
             <DialogRef Id="MaintenanceTypeDlg" />
             <DialogRef Id="VerifyReadyDlg" />
             <DialogRef Id="ExitDialog" />
+            <DialogRef Id="BrowseDlg" />
 
             <Dialog Id="QuickViewWelcome" Width="370" Height="270" Title="[ProductName] 安裝程式">
                 <Control Id="Bitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="234" TabSkip="no"
@@ -191,11 +229,24 @@
                          Text="安裝完成後，可在 Windows 設定選用專用圖示及雙擊開啟方式。" />
                 <Control Id="UpgradeDescription" Type="Text" X="135" Y="166" Width="220" Height="40"
                          Transparent="yes" NoPrefix="yes" Hidden="yes" ShowCondition="WIX_UPGRADE_DETECTED"
-                         Text="已偵測到先前安裝的版本，會直接覆蓋更新，並保留您的顏色設定。" />
+                         Text="已偵測到先前安裝的版本，會在原位置直接覆蓋更新，並保留您的顏色設定。" />
+                <!-- New installs only: pick the folder. Per-user install, so it must be writable without admin rights. -->
+                <Control Id="FolderLabel" Type="Text" X="135" Y="160" Width="220" Height="12" Transparent="yes"
+                         NoPrefix="yes" HideCondition="WIX_UPGRADE_DETECTED"
+                         Text="安裝位置（需為您可寫入的資料夾）：" />
+                <Control Id="Folder" Type="PathEdit" X="135" Y="175" Width="164" Height="17" Property="INSTALLFOLDER"
+                         HideCondition="WIX_UPGRADE_DETECTED" />
+                <Control Id="Browse" Type="PushButton" X="303" Y="174" Width="52" Height="18" Text="瀏覽…"
+                         HideCondition="WIX_UPGRADE_DETECTED">
+                    <Publish Property="_BrowseProperty" Value="INSTALLFOLDER" Order="1" />
+                    <Publish Event="SpawnDialog" Value="BrowseDlg" Order="2" />
+                </Control>
                 <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
                 <Control Id="Install" Type="PushButton" X="226" Y="243" Width="60" Height="18"
                          Default="yes" Text="[QV_ACTION]">
-                    <Publish Event="EndDialog" Value="Return" />
+                    <!-- Applies (and validates) the typed or browsed folder before installing. -->
+                    <Publish Event="SetTargetPath" Value="INSTALLFOLDER" Order="1" Condition="NOT WIX_UPGRADE_DETECTED" />
+                    <Publish Event="EndDialog" Value="Return" Order="2" />
                 </Control>
                 <Control Id="Cancel" Type="PushButton" X="296" Y="243" Width="54" Height="18"
                          Cancel="yes" Text="取消">
@@ -203,6 +254,9 @@
                 </Control>
             </Dialog>
 
+            <Publish Dialog="BrowseDlg" Control="OK" Event="CheckTargetPath" Value="INSTALLFOLDER" Order="1" />
+            <Publish Dialog="BrowseDlg" Control="OK" Event="SetTargetPath" Value="INSTALLFOLDER" Order="2" />
+            <Publish Dialog="BrowseDlg" Control="OK" Event="EndDialog" Value="Return" Order="3" />
             <Publish Dialog="MaintenanceWelcomeDlg" Control="Next" Event="NewDialog" Value="MaintenanceTypeDlg" />
             <Publish Dialog="MaintenanceTypeDlg" Control="RepairButton" Event="NewDialog" Value="VerifyReadyDlg" />
             <Publish Dialog="MaintenanceTypeDlg" Control="RemoveButton" Event="NewDialog" Value="VerifyReadyDlg" />

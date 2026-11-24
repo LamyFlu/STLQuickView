@@ -34,8 +34,11 @@ std::string Lower(string_view text) {
     return out;
 }
 
+// Face limit for the load running on this thread (set by Load).
+thread_local size_t faceLimit = stl::MaxFaces;
+
 void AddTriangle(stl::Mesh& mesh, stl::Point a, stl::Point b, stl::Point c) {
-    if (mesh.triangles.size() >= stl::MaxFaces) Fail("模型超過 200 萬個三角面。");
+    if (mesh.triangles.size() >= faceLimit) throw stl::TooLarge("模型三角面數超過上限。", 0, 0);
     mesh.triangles.push_back({a, b, c});
 }
 
@@ -254,15 +257,19 @@ private:
 
 // ---- ZIP container --------------------------------------------------------------------------
 
-constexpr string_view PlatePictures[] = {
-    "metadata/plate_1.png", "metadata/plate_1_small.png", "metadata/top_1.png"
-};
+// In picture-only (stream) mode the directory keeps just these: the package relationships and
+// image files, which is all thumbnail lookup needs.
+bool IsPictureLookupEntry(string_view name) {
+    return name == "_rels/.rels" || name.ends_with(".png") || name.ends_with(".jpg") || name.ends_with(".jpeg");
+}
 constexpr size_t MaxPictureBytes = 2 * 1024 * 1024, MaxPictureDirectory = 1024 * 1024;
 
 class Zip {
 public:
-    explicit Zip(std::span<const char> bytes)
-        : data(reinterpret_cast<const uint8_t*>(bytes.data())), size(bytes.size()) { Index(); }
+    explicit Zip(std::span<const char> bytes, uint64_t maxUnpacked = MaxInflated)
+        : data(reinterpret_cast<const uint8_t*>(bytes.data())), size(bytes.size()), remaining(maxUnpacked) {
+        Index();
+    }
 
     explicit Zip(IStream& source) : stream(&source) {
         STATSTG stat{};
@@ -283,9 +290,10 @@ public:
         const auto found = entries_.find(Key(name));
         if (found == entries_.end()) Fail("3MF 缺少模型資料。");
         const Entry& entry = found->second;
-        const uint64_t limit = stream ? MaxPictureBytes : MaxInflated;
+        const uint64_t limit = stream ? MaxPictureBytes : remaining;
         if (entry.unpacked > limit || (stream && entry.packed > limit))
             Fail("3MF 項目超過大小限制。");
+        if (!stream) remaining -= entry.unpacked;   // budget shared by every part read from the package
         if (entry.flags & 1) Fail("3MF 使用了加密的 ZIP 項目。");
         std::vector<uint8_t> buffer;
         const auto* header = Range(entry.offset, 30, buffer);
@@ -350,10 +358,9 @@ private:
             const size_t rowSize = 46 + nameLength + extraLength + commentLength;
             if (rowSize > directorySize - at) Fail("3MF ZIP 目錄損毀。");
             at += rowSize;
-            if (stream && (nameLength < 18 || nameLength > 32)) continue;
+            if (stream && nameLength > 200) continue;
             const auto name = Key(string_view(reinterpret_cast<const char*>(row + 46), nameLength));
-            if (stream && std::find(std::begin(PlatePictures), std::end(PlatePictures), name) == std::end(PlatePictures))
-                continue;
+            if (stream && !IsPictureLookupEntry(name)) continue;
             Entry entry;
             entry.flags = U16(row + 8);
             entry.method = U16(row + 10);
@@ -413,6 +420,7 @@ private:
     const uint8_t* data{};
     IStream* stream{};
     uint64_t size{};
+    mutable uint64_t remaining = MaxInflated;
     std::map<std::string, Entry> entries_;
 };
 
@@ -725,8 +733,8 @@ bool BambuMultiColor(const Zip& zip) {
     return colors.size() > 1;
 }
 
-Model Load3mf(std::span<const char> bytes) {
-    const Zip zip(bytes);
+Model Load3mf(std::span<const char> bytes, uint64_t maxUnpacked) {
+    const Zip zip(bytes, maxUnpacked);
     Model result;
     result.format = L"3MF";
     // The package relationships name the root model part.
@@ -1013,11 +1021,11 @@ Model LoadPly(std::span<const char> bytes) {
 
 // ---- STL ------------------------------------------------------------------------------------
 
-Model LoadStl(std::span<const char> bytes) {
+Model LoadStl(std::span<const char> bytes, stl::Limits limits) {
     Model result;
     result.format = L"STL";
     stl::StlInfo info;
-    result.mesh = stl::Parse(bytes, &info);   // already normalised
+    result.mesh = stl::Parse(bytes, &info, limits);   // already normalised
     result.hasColor = info.color;
     if (info.solids.size() > 1) {
         for (size_t i = 0; i < info.solids.size(); ++i) {
@@ -1041,29 +1049,75 @@ std::string Extension(const std::wstring& path) {
 }
 }
 
-std::string ReadFirstPlateImage(IStream& stream) {
+std::string ReadFirstPlateImage(IStream& stream, unsigned requested) {
     const Zip zip(stream);
-    for (const auto name : PlatePictures) {
-        if (!zip.Has(name)) continue;
+    const bool wantSmall = requested <= 128;
+    std::vector<std::string> candidates;
+    // Bambu Studio / OrcaSlicer: the first plate, small or large to suit the requested size.
+    if (wantSmall) candidates.push_back("metadata/plate_1_small.png");
+    candidates.push_back("metadata/plate_1.png");
+    // 3MF core specification: the package thumbnail named by the root relationships
+    // (PrusaSlicer, Cura and Windows write this), then its usual location.
+    if (zip.Has("_rels/.rels")) {
+        try {
+            const auto rels = zip.Read("_rels/.rels");
+            XmlScanner scanner(rels);
+            Tag tag;
+            while (scanner.Next(tag)) {
+                if (tag.name != "Relationship" || tag.closing) continue;
+                std::string type, target;
+                ForEachAttribute(tag.attributes, [&](string_view k, string_view v) {
+                    if (k == "Type") type = Lower(v);
+                    else if (k == "Target") target = Unescape(v);
+                });
+                if (type.ends_with("/metadata/thumbnail") && !target.empty()) candidates.push_back(Lower(target));
+            }
+        } catch (const std::runtime_error&) {
+            // Unreadable relationships: fall back to the conventional names below.
+        }
+    }
+    candidates.push_back("metadata/thumbnail.png");
+    if (!wantSmall) candidates.push_back("metadata/plate_1_small.png");
+    candidates.push_back("metadata/top_1.png");
+
+    std::set<std::string> tried;
+    for (auto name : candidates) {
+        name.erase(0, name.find_first_not_of('/'));
+        if (!tried.insert(name).second || !zip.Has(name)) continue;
         try {
             auto bytes = zip.Read(name);
-            if (string_view(bytes).starts_with("\x89PNG\r\n\x1a\n")) return bytes;
+            const string_view head(bytes);
+            if (head.starts_with("\x89PNG\r\n\x1a\n") || head.starts_with("\xFF\xD8\xFF")) return bytes;
         } catch (const std::runtime_error&) {
-            // An unusable picture can still have a smaller first-plate alternative.
+            // An unusable picture can still have an alternative.
         }
     }
     return {};
 }
 
-Model Load(const std::wstring& path, std::span<const char> bytes) {
+Model Load(const std::wstring& path, std::span<const char> bytes, uint64_t maxUnpacked, stl::Limits limits) {
     if (bytes.empty()) throw std::runtime_error("這個檔案是空的。");
+    if (bytes.size() > limits.bytes) throw stl::TooLarge("檔案超過大小上限。", 0, bytes.size());
+    struct LimitScope {
+        explicit LimitScope(size_t faces) { faceLimit = faces; }
+        ~LimitScope() { faceLimit = stl::MaxFaces; }
+    } scope(limits.faces);
+    // A confirmed oversized load may also unpack more.
+    if (!maxUnpacked) maxUnpacked = limits.faces > stl::MaxFaces ? 4 * MaxInflated : MaxInflated;
     const string_view head(bytes.data(), std::min<size_t>(bytes.size(), 64));
     std::string ext = Extension(path);
     if (ext != "stl" && ext != "3mf" && ext != "obj" && ext != "ply") {
-        ext = head.starts_with("PK\x03\x04") ? "3mf" : head.starts_with("ply") ? "ply" : "stl";
+        // No usable extension (e.g. a stream without a name): recognise the content instead.
+        uint32_t facets{};
+        if (bytes.size() >= 84) std::memcpy(&facets, bytes.data() + 80, sizeof facets);
+        const bool binaryStl = bytes.size() >= 84 && 84ull + 50ull * facets == bytes.size();
+        const string_view start(bytes.data(), std::min<size_t>(bytes.size(), 64 * 1024));
+        const bool obj = !binaryStl && !start.starts_with("solid") &&
+                         (start.starts_with("v ") || start.find("\nv ") != string_view::npos);
+        ext = head.starts_with("PK\x03\x04") ? "3mf" : head.starts_with("ply") ? "ply" : obj ? "obj" : "stl";
     }
-    Model result = ext == "3mf" ? Load3mf(bytes) : ext == "obj" ? LoadObj(bytes) : ext == "ply" ? LoadPly(bytes)
-                                                                                     : LoadStl(bytes);
+    Model result = ext == "3mf" ? Load3mf(bytes, maxUnpacked) : ext == "obj" ? LoadObj(bytes) : ext == "ply" ? LoadPly(bytes)
+                                                                                     : LoadStl(bytes, limits);
     if (result.format != L"STL") stl::Normalize(result.mesh);
     if (result.parts.empty()) result.parts.push_back({L"模型", 0, result.mesh.triangles.size()});
     const auto& mesh = result.mesh;

@@ -24,7 +24,8 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 }
 
 namespace {
-constexpr WORD OpenButton = 101, ResetButton = 102, SettingsButton = 104, AxesCommand = 105, GridCommand = 106;
+constexpr WORD OpenButton = 101, ResetButton = 102, SettingsButton = 104, AxesCommand = 105, GridCommand = 106,
+               ConfirmButton = 108, CancelLoadButton = 109;
 constexpr UINT_PTR AnimTimer = 107;
 constexpr UINT LoadDone = WM_APP + 1, RendererLost = WM_APP + 2;
 constexpr double Pi = 3.141592653589793, HalfTurn = Pi, QuarterTurn = Pi / 2, FullTurn = 2 * Pi;
@@ -57,6 +58,9 @@ struct LoadResult {
     model::Model model;
     std::vector<render::Vertex> vertices;
     std::wstring error;
+    // The file is over the normal limits: ask before loading it with the extended ones.
+    bool tooLarge{};
+    uint64_t faces{}, bytes{};
 };
 
 // Renderer preference, stored as the "Renderer" setting.
@@ -85,6 +89,9 @@ struct App {
     stl::Palette palette = stl::ReadPalette();
     std::wstring path, filename, message, queued;
     bool keepView{};                   // reload after a renderer switch keeps the camera
+    HWND confirm{}, cancelLoad{};      // "load anyway" / "cancel" for oversized files
+    bool confirmPending{};             // waiting for the user to confirm an oversized load
+    bool extendedLoad{};               // the current file was loaded with the extended limits
     std::shared_ptr<LoadResult> loading;
     POINT last{};
     UINT drag{};
@@ -109,13 +116,13 @@ void LayoutParts(App& app);
 // Read-only memory mapping of the whole file: no heap copy before parsing.
 class MappedFile {
 public:
-    explicit MappedFile(const std::wstring& path) {
+    MappedFile(const std::wstring& path, uint64_t limit) {
         file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
         if (file == INVALID_HANDLE_VALUE) throw std::runtime_error("無法開啟這個檔案。");
         LARGE_INTEGER length{};
-        if (!GetFileSizeEx(file, &length) || length.QuadPart < 0 || uint64_t(length.QuadPart) > stl::MaxBytes)
-            throw std::runtime_error("檔案超過 128 MiB，或無法讀取檔案大小。");
+        if (!GetFileSizeEx(file, &length) || length.QuadPart < 0) throw std::runtime_error("無法讀取檔案大小。");
+        if (uint64_t(length.QuadPart) > limit) throw stl::TooLarge("檔案超過大小上限。", 0, uint64_t(length.QuadPart));
         size = size_t(length.QuadPart);
         if (size == 0) return;
         mapping = CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
@@ -155,13 +162,26 @@ std::vector<render::Vertex> BuildVertices(const stl::Mesh& mesh) {
     return vertices;
 }
 
-void ReadModel(const std::wstring& path, const std::shared_ptr<LoadResult>& result, HWND notify) noexcept {
+void ReadModel(const std::wstring& path, const std::shared_ptr<LoadResult>& result, HWND notify,
+               bool extended) noexcept {
     try {
+        const stl::Limits limits = extended ? stl::ExtendedLimits : stl::Limits{};
         {
-            const MappedFile file(path);
-            result->model = model::Load(path, file.Bytes());
+            const MappedFile file(path, limits.bytes);
+            result->model = model::Load(path, file.Bytes(), 0, limits);
         }
         result->vertices = BuildVertices(result->model.mesh);
+    } catch (const stl::TooLarge& error) {
+        if (extended) {
+            result->error = L"這個模型超過可載入的上限（3,000 萬個三角面或 2 GiB）。";
+        } else {
+            result->tooLarge = true;
+            result->faces = error.faces;
+            std::error_code ignored;
+            result->bytes = std::filesystem::file_size(std::filesystem::path(path), ignored);
+        }
+    } catch (const std::bad_alloc&) {
+        result->error = L"記憶體不足，無法載入這個模型。";
     } catch (const std::exception& error) {
         wchar_t detail[256]{};
         MultiByteToWideChar(CP_UTF8, 0, error.what(), -1, detail, ARRAYSIZE(detail));
@@ -221,11 +241,49 @@ void CreateRenderer(App& app) {
     }
 }
 
-void OpenModel(App& app, std::wstring path) {
+void ShowConfirm(App& app, bool show) {
+    app.confirmPending = show;
+    for (const HWND button : {app.confirm, app.cancelLoad}) {
+        if (!button) continue;
+        if (show) SetWindowPos(button, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        else ShowWindow(button, SW_HIDE);
+    }
+}
+
+// Explains why a file needs confirmation, with a memory estimate when the size is known.
+std::wstring OversizeMessage(uint64_t faces, uint64_t bytes) {
+    const auto grouped = [](uint64_t value) {
+        std::wstring text = std::to_wstring(value);
+        for (int i = int(text.size()) - 3; i > 0; i -= 3) text.insert(size_t(i), 1, L',');
+        return text;
+    };
+    std::wstring text;
+    if (faces) text = L"這個模型有 " + grouped(faces) + L" 個三角面，超過建議上限 200 萬。";
+    else if (bytes > stl::MaxBytes) text = L"這個檔案有 " + grouped(bytes >> 20) + L" MiB，超過建議上限 128 MiB。";
+    else text = L"這個模型超過建議上限 200 萬個三角面。";
+    // Roughly 200 bytes per face: triangles, GPU vertices and the driver's copy.
+    const uint64_t estimate = faces ? faces * 200 : bytes ? bytes * 4 : 0;
+    if (estimate) {
+        wchar_t line[160]{};
+        swprintf_s(line, L"預估需要約 %.1f GB 記憶體", estimate / 1073741824.0);
+        text += line;
+        MEMORYSTATUSEX memory{sizeof(memory)};
+        if (GlobalMemoryStatusEx(&memory) && estimate > memory.ullAvailPhys) {
+            swprintf_s(line, L"，目前可用約 %.1f GB，可能不足", memory.ullAvailPhys / 1073741824.0);
+            text += line;
+        }
+        text += L"。";
+    }
+    return text + L"載入需要較多時間，確定要載入嗎？";
+}
+
+void OpenModel(App& app, std::wstring path, bool extended = false) {
     if (app.loading) {
         app.queued = std::move(path);
         return;
     }
+    ShowConfirm(app, false);
+    app.extendedLoad = extended;
     try {
         app.filename = std::filesystem::path(path).filename().wstring();
         app.path = path;
@@ -239,7 +297,7 @@ void OpenModel(App& app, std::wstring path) {
         if (app.renderer) app.renderer->Upload({});
         ShowSurface(app);
         auto result = std::make_shared<LoadResult>();
-        std::thread(ReadModel, std::move(path), result, app.window).detach();
+        std::thread(ReadModel, std::move(path), result, app.window, extended).detach();
         app.loading = std::move(result);
         app.message = L"正在載入模型…";
     } catch (const std::exception&) {
@@ -256,6 +314,13 @@ void FinishLoad(App& app) {
         auto path = std::move(app.queued);
         app.queued.clear();
         OpenModel(app, std::move(path));
+        return;
+    }
+    if (result->tooLarge) {
+        app.message = OversizeMessage(result->faces, result->bytes);
+        ShowConfirm(app, true);
+        EnableWindow(app.reset, FALSE);
+        Refresh(app);
         return;
     }
     auto& loaded = result->model;
@@ -282,9 +347,9 @@ void FinishLoad(App& app) {
 // Rebuilds the renderer (after a settings change or a lost device) and reloads the model.
 void RestartRenderer(App& app) {
     CreateRenderer(app);
-    if (!app.path.empty() && !app.loading) {
+    if (!app.path.empty() && !app.loading && !app.confirmPending) {
         app.keepView = true;
-        OpenModel(app, app.path);
+        OpenModel(app, app.path, app.extendedLoad);
     }
     Refresh(app);
 }
@@ -311,18 +376,101 @@ void DrawTextLine(HDC dc, std::wstring_view text, RECT box, HFONT font, COLORREF
     SelectObject(dc, previous);
 }
 
-// 1, 2 or 5 times a power of ten, at least `raw`.
-double NiceStep(double raw) {
-    if (!(raw > 0)) return 1;
-    const double magnitude = std::pow(10.0, std::floor(std::log10(raw)));
-    for (const double factor : {1.0, 2.0, 5.0, 10.0})
-        if (factor * magnitude >= raw) return factor * magnitude;
-    return 10 * magnitude;
+// The unit the on-screen numbers are in: a unit stated in the file (3MF) wins over the setting.
+enum class UnitKind { Metric, Inch, Foot };
+
+const wchar_t* UnitSuffix(const App& app) {
+    return !app.fileUnit.empty() ? app.fileUnit.c_str() : Units[app.unit].suffix;
 }
 
-double GridStep(const App& app) {
-    if (!app.showGrid || app.faces == 0) return 0;
-    return NiceStep(std::max({app.mesh.width, app.mesh.depth, app.mesh.diameter * 0.2}) * 1.6 / 12);
+UnitKind EffectiveUnit(const App& app) {
+    const std::wstring_view suffix = UnitSuffix(app);
+    if (suffix == L" in") return UnitKind::Inch;
+    if (suffix == L" ft") return UnitKind::Foot;
+    return UnitKind::Metric;
+}
+
+// Grid spacing that reads naturally in the unit, and how often a line is emphasised:
+// metric 1-2-5 steps with heavier lines every 5 or 10 units; inches in binary fractions with
+// heavier lines on whole inches (or every foot); feet in inch fractions up to round feet.
+struct GridSpacing {
+    double step;
+    int major;
+};
+
+GridSpacing MetricGrid(double raw) {
+    const double magnitude = std::pow(10.0, std::floor(std::log10(raw)));
+    if (raw <= magnitude) return {magnitude, 5};
+    if (raw <= 2 * magnitude) return {2 * magnitude, 5};
+    if (raw <= 5 * magnitude) return {5 * magnitude, 2};
+    return {10 * magnitude, 5};
+}
+
+GridSpacing NiceGrid(double raw, UnitKind kind) {
+    if (!(raw > 0)) return {1, 5};
+    if (kind == UnitKind::Inch) {
+        static constexpr double steps[] = {1.0 / 64, 1.0 / 32, 1.0 / 16, 1.0 / 8, 1.0 / 4, 1.0 / 2,
+                                           1, 2, 3, 6, 12, 24, 36, 60, 120, 240, 600, 1200};
+        for (const double step : steps) {
+            if (step < raw) continue;
+            const int major = step < 1 ? int(std::lround(1 / step)) : step < 12 ? int(std::lround(12 / step)) : 5;
+            return {step, std::max(2, major)};
+        }
+        return {MetricGrid(raw / 12).step * 12, 5};
+    }
+    if (kind == UnitKind::Foot) {
+        static constexpr double steps[] = {1.0 / 12, 1.0 / 6, 1.0 / 4, 1.0 / 2, 1, 2, 5, 10, 20, 50, 100};
+        for (const double step : steps)
+            if (step >= raw) return {step, step < 1 ? std::max(2, int(std::lround(1 / step))) : 5};
+    }
+    return MetricGrid(raw);
+}
+
+// Inches below one read better as fractions ("1/4"); everything else uses plain decimals.
+std::wstring FormatLength(double value, UnitKind kind) {
+    if (kind == UnitKind::Inch && value < 1) {
+        for (int denominator = 2; denominator <= 64; denominator *= 2) {
+            const double numerator = value * denominator;
+            if (std::abs(numerator - std::round(numerator)) < 1e-9)
+                return std::to_wstring(std::lround(numerator)) + L"/" + std::to_wstring(denominator);
+        }
+    }
+    wchar_t text[32]{};
+    swprintf_s(text, L"%.5g", value);
+    return text;
+}
+
+// What is on screen: the whole model, or the selected part shown on its own (centred and
+// rescaled as if it had been opened by itself).
+struct ShownFrame {
+    double center[3], size[3], diameter;   // file units
+    stl::Point offset;                     // placement in normalised model space
+    float scale;
+};
+
+ShownFrame Shown(const App& app) {
+    const auto& m = app.mesh;
+    ShownFrame f{{m.center[0], m.center[1], m.center[2]}, {m.width, m.depth, m.height}, m.diameter, {}, 1};
+    if (app.selectedPart < 0 || size_t(app.selectedPart) >= app.partList.size()) return f;
+    const auto& part = app.partList[size_t(app.selectedPart)];
+    const double mid[3] = {(part.min.x + part.max.x) * 0.5, (part.min.y + part.max.y) * 0.5,
+                           (part.min.z + part.max.z) * 0.5};
+    const double dx = part.max.x - part.min.x, dy = part.max.y - part.min.y, dz = part.max.z - part.min.z;
+    const double length = std::max(std::sqrt(dx * dx + dy * dy + dz * dz), 1e-9);
+    for (int i = 0; i < 3; ++i) {
+        f.center[i] = m.center[i] + mid[i] * m.diameter;
+        f.size[i] = part.size[i];
+    }
+    f.diameter = length * m.diameter;
+    f.offset = {float(mid[0]), float(mid[1]), float(mid[2])};
+    f.scale = float(1 / length);
+    return f;
+}
+
+GridSpacing GridFor(const App& app) {
+    if (!app.showGrid || app.faces == 0) return {0, 5};
+    const auto f = Shown(app);
+    return NiceGrid(std::max({f.size[0], f.size[1], f.diameter * 0.2}) * 1.6 / 12, EffectiveUnit(app));
 }
 
 // Everything the GPU back ends need for one frame.
@@ -339,19 +487,23 @@ render::Scene BuildScene(const App& app, int width, int height) {
         scene.count = uint32_t(part.count * 3);
     }
     const auto& m = app.mesh;
-    // Floor grid under the model, aligned to the file's coordinate system.
-    if (const double step = GridStep(app); step > 0) {
-        const double half = std::max({m.width, m.depth, m.diameter * 0.2}) * 0.8;
-        const long long x0 = std::llround(std::floor((m.center[0] - half) / step));
-        const long long x1 = std::llround(std::ceil((m.center[0] + half) / step));
-        const long long y0 = std::llround(std::floor((m.center[1] - half) / step));
-        const long long y1 = std::llround(std::ceil((m.center[1] + half) / step));
-        const double floorZ = m.center[2] - m.height / 2 - m.diameter * 0.002;
+    const auto shown = Shown(app);
+    scene.offset = shown.offset;
+    scene.scale = shown.scale;
+    // Floor grid under what is shown, aligned to the file's coordinate system.
+    if (const auto grid = GridFor(app); grid.step > 0) {
+        const double step = grid.step;
+        const double half = std::max({shown.size[0], shown.size[1], shown.diameter * 0.2}) * 0.8;
+        const long long x0 = std::llround(std::floor((shown.center[0] - half) / step));
+        const long long x1 = std::llround(std::ceil((shown.center[0] + half) / step));
+        const long long y0 = std::llround(std::floor((shown.center[1] - half) / step));
+        const long long y1 = std::llround(std::ceil((shown.center[1] + half) / step));
+        const double floorZ = shown.center[2] - shown.size[2] / 2 - shown.diameter * 0.002;
         const auto bg = app.palette.background;
         const bool dark = 299 * GetRValue(bg) + 587 * GetGValue(bg) + 114 * GetBValue(bg) < 128000;
         const float tone = dark ? 1.f : 0.f;
         const auto line = [&](double ax, double ay, double bx, double by, long long index) {
-            const float alpha = index % 5 == 0 ? 0.20f : 0.08f;
+            const float alpha = index % grid.major == 0 ? 0.20f : 0.08f;
             const auto a = m.ToModel(ax, ay, floorZ), b = m.ToModel(bx, by, floorZ);
             scene.grid.push_back({a.x, a.y, a.z, tone, tone, tone, alpha});
             scene.grid.push_back({b.x, b.y, b.z, tone, tone, tone, alpha});
@@ -359,13 +511,15 @@ render::Scene BuildScene(const App& app, int width, int height) {
         for (long long i = x0; i <= x1; ++i) line(i * step, y0 * step, i * step, y1 * step, i);
         for (long long i = y0; i <= y1; ++i) line(x0 * step, i * step, x1 * step, i * step, i);
     }
-    // Axes at the file origin, or at the bounding-box corner when the origin is far away.
+    // Axes at the file origin, or at the shown box's corner when the origin is far away.
     scene.axes = app.showAxes;
-    scene.axisLength = 0.42f;
+    scene.axisLength = 0.42f / shown.scale;
     scene.origin = m.ToModel(0, 0, 0);
-    const auto& o = scene.origin;
+    const stl::Point o{(scene.origin.x - shown.offset.x) * shown.scale, (scene.origin.y - shown.offset.y) * shown.scale,
+                       (scene.origin.z - shown.offset.z) * shown.scale};
     if (std::sqrt(o.x * o.x + o.y * o.y + o.z * o.z) > 0.9f)
-        scene.origin = m.ToModel(m.center[0] - m.width / 2, m.center[1] - m.depth / 2, m.center[2] - m.height / 2);
+        scene.origin = m.ToModel(shown.center[0] - shown.size[0] / 2, shown.center[1] - shown.size[1] / 2,
+                                 shown.center[2] - shown.size[2] / 2);
     return scene;
 }
 
@@ -389,8 +543,21 @@ void PaintCanvas(App& app, HDC dc, RECT bounds) {
             first = app.partList[size_t(app.selectedPart)].first;
             count = app.partList[size_t(app.selectedPart)].count;
         }
-        const auto frame = stl::Render(app.mesh, int(width * shrink), int(height * shrink),
-                                      app.view, 100'000, 30'000'000, app.palette, false, first, count);
+        const int frameWidth = std::max(1, int(width * shrink)), frameHeight = std::max(1, int(height * shrink));
+        // Fold the part placement into the view: zoom by its scale and pan its centre to the middle.
+        stl::View view = app.view;
+        if (const auto shown = Shown(app); shown.scale != 1) {
+            const double cy = std::cos(view.yaw), sy = std::sin(view.yaw);
+            const double cp = std::cos(view.pitch), sp = std::sin(view.pitch);
+            const auto& o = shown.offset;
+            const double across = cy * o.x - sy * o.y, up = sp * (sy * o.x + cy * o.y) + cp * o.z;
+            view.zoom *= shown.scale;
+            const double unit = 0.89 * std::min(frameWidth, frameHeight) * view.zoom;
+            view.panX -= across * unit / frameWidth;
+            view.panY += up * unit / frameHeight;
+        }
+        const auto frame = stl::Render(app.mesh, frameWidth, frameHeight, view, 100'000, 30'000'000,
+                                      app.palette, false, first, count);
         stl::PaintFrame(dc, bounds, frame);
         return;
     }
@@ -399,7 +566,7 @@ void PaintCanvas(App& app, HDC dc, RECT bounds) {
     if (app.gpuModel) return;
     const auto center = height / 2;
     RECT heading{app.Px(24), center - app.Px(54), width - app.Px(24), center + app.Px(6)};
-    RECT detail{app.Px(24), center + app.Px(15), width - app.Px(24), center + app.Px(65)};
+    RECT detail{app.Px(24), center + app.Px(15), width - app.Px(24), center + app.Px(app.confirmPending ? 85 : 65)};
     const bool idle = app.message.empty();
     const auto bg = app.palette.background;
     const bool dark = 299 * GetRValue(bg) + 587 * GetGValue(bg) + 114 * GetBValue(bg) < 128000;
@@ -516,6 +683,13 @@ void Settings(App& app) {
     constexpr UINT UnitBase = 20;
     for (UINT i = 0; i < ARRAYSIZE(Units); ++i)
         AppendMenuW(units, MF_STRING | (i == app.unit ? MF_CHECKED : 0), UnitBase + i, Units[i].menu);
+    AppendMenuW(units, MF_SEPARATOR, 0, nullptr);
+    if (!app.fileUnit.empty()) {
+        const std::wstring note = L"目前檔案已標示單位：" + app.fileUnit.substr(1) + L"（以檔案為準）";
+        AppendMenuW(units, MF_STRING | MF_GRAYED, 0, note.c_str());
+    } else if (app.faces > 0) {
+        AppendMenuW(units, MF_STRING | MF_GRAYED, 0, L"目前檔案未標示單位，格線依上方選擇調整");
+    }
     AppendMenuW(menu, MF_STRING | (app.showAxes ? MF_CHECKED : 0), 10, L"顯示座標軸\tA");
     AppendMenuW(menu, MF_STRING | (app.showGrid ? MF_CHECKED : 0), 11, L"顯示地板格線\tG");
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(units), L"尺寸單位");
@@ -666,7 +840,10 @@ void PaintCube(App& app, HWND window, HDC target) {
         };
         Gdiplus::LinearGradientBrush backdrop(Gdiplus::Point(0, -1), Gdiplus::Point(0, area.bottom + 1),
                                               shade(0), shade(area.bottom));
-        g.FillRectangle(&backdrop, -1, -1, size + 2, area.bottom + 2);
+        // The gradient only exists while a model is drawn; otherwise the canvas is a flat colour.
+        Gdiplus::SolidBrush flat(Gdi(bg));
+        if (app.gpuModel) g.FillRectangle(&backdrop, -1, -1, size + 2, area.bottom + 2);
+        else g.FillRectangle(&flat, -1, -1, size + 2, area.bottom + 2);
         const bool dark = 299 * GetRValue(bg) + 587 * GetGValue(bg) + 114 * GetBValue(bg) < 128000;
         // Soft disc behind the cube.
         Gdiplus::SolidBrush disc(dark ? Gdiplus::Color(28, 255, 255, 255) : Gdiplus::Color(20, 0, 0, 0));
@@ -821,41 +998,12 @@ void LayoutParts(App& app) {
     InvalidateRect(app.parts, nullptr, FALSE);
 }
 
-// Frames a normalised bounding box with the current viewing angles.
-stl::View FitBox(const App& app, stl::Point lo, stl::Point hi) {
-    stl::View view = app.view;
-    RECT area{};
-    GetClientRect(app.canvas, &area);
-    const double width = std::max(1L, area.right), height = std::max(1L, area.bottom);
-    const double cy = std::cos(view.yaw), sy = std::sin(view.yaw);
-    const double cp = std::cos(view.pitch), sp = std::sin(view.pitch);
-    double left = 1e30, right = -1e30, low = 1e30, high = -1e30;
-    for (int i = 0; i < 8; ++i) {
-        const double x = i & 1 ? hi.x : lo.x, y = i & 2 ? hi.y : lo.y, z = i & 4 ? hi.z : lo.z;
-        const double across = cy * x - sy * y, up = sp * (sy * x + cy * y) + cp * z;
-        left = std::min(left, across);
-        right = std::max(right, across);
-        low = std::min(low, up);
-        high = std::max(high, up);
-    }
-    const double side = std::min(width, height);
-    const double extent = std::max({(right - left) * side / width, (high - low) * side / height, 1e-6});
-    view.zoom = std::clamp(0.9 / extent, 0.05, 100.0);
-    const double unit = 0.89 * side * view.zoom;   // pixels per model unit
-    view.panX = -unit * (left + right) * 0.5 / width;
-    view.panY = unit * (low + high) * 0.5 / height;
-    return view;
-}
-
 void SelectPart(App& app, int index) {
     if (index == app.selectedPart) return;
     app.selectedPart = index;
-    if (index < 0) {
-        AnimateTo(app, {app.view.yaw, app.view.pitch, 1, 0, 0});
-    } else {
-        const auto& part = app.partList[size_t(index)];
-        AnimateTo(app, FitBox(app, part.min, part.max));
-    }
+    StopAnimation(app);
+    // Show the part as if it had been opened on its own: centred and framed, same viewing angle.
+    app.view = {app.view.yaw, app.view.pitch, 1, 0, 0};
     Refresh(app);
 }
 
@@ -1128,6 +1276,11 @@ void Layout(App& app) {
     MoveWindow(app.open, w - app.Px(307), app.Px(17), app.Px(98), app.Px(34), TRUE);
     MoveWindow(app.reset, w - app.Px(199), app.Px(17), app.Px(93), app.Px(34), TRUE);
     MoveWindow(app.settings, w - app.Px(96), app.Px(17), app.Px(76), app.Px(34), TRUE);
+    // Confirmation buttons sit under the canvas message (see PaintCanvas).
+    const int canvasTop = app.Px(68), canvasHeight = std::max(0, h - app.Px(114));
+    const int buttonsY = canvasTop + canvasHeight / 2 + app.Px(96);
+    SetWindowPos(app.confirm, HWND_TOP, w / 2 - app.Px(106), buttonsY, app.Px(100), app.Px(34), SWP_NOACTIVATE);
+    SetWindowPos(app.cancelLoad, HWND_TOP, w / 2 + app.Px(6), buttonsY, app.Px(100), app.Px(34), SWP_NOACTIVATE);
     MoveWindow(app.canvas, 0, app.Px(68), w, std::max(0, h - app.Px(114)), TRUE);
     SetWindowPos(app.cube, HWND_TOP, w - app.Px(122), app.Px(78), app.Px(110), app.Px(110),
                  SWP_NOACTIVATE);
@@ -1159,6 +1312,10 @@ LRESULT CALLBACK MainProc(HWND window, UINT msg, WPARAM wp, LPARAM lp) {
         Fonts(*app);
         app->canvas = CreateWindowExW(0, CanvasClass, nullptr, WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
                                      0, 0, 0, 0, window, nullptr, GetModuleHandleW(nullptr), app);
+        app->confirm = CreateWindowExW(0, L"BUTTON", L"仍要載入", WS_CHILD | WS_TABSTOP | BS_OWNERDRAW,
+                                      0, 0, 0, 0, window, reinterpret_cast<HMENU>(INT_PTR(ConfirmButton)), nullptr, nullptr);
+        app->cancelLoad = CreateWindowExW(0, L"BUTTON", L"取消", WS_CHILD | WS_TABSTOP | BS_OWNERDRAW,
+                                         0, 0, 0, 0, window, reinterpret_cast<HMENU>(INT_PTR(CancelLoadButton)), nullptr, nullptr);
         app->open = CreateWindowExW(0, L"BUTTON", L"開啟模型", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                                    0, 0, 0, 0, window, reinterpret_cast<HMENU>(INT_PTR(OpenButton)), nullptr, nullptr);
         app->reset = CreateWindowExW(0, L"BUTTON", L"重設視角", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
@@ -1191,6 +1348,12 @@ LRESULT CALLBACK MainProc(HWND window, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_COMMAND:
         if (LOWORD(wp) == OpenButton) Browse(*app);
+        if (LOWORD(wp) == ConfirmButton && app->confirmPending) OpenModel(*app, app->path, true);
+        if (LOWORD(wp) == CancelLoadButton && app->confirmPending) {
+            ShowConfirm(*app, false);
+            app->message = L"已取消載入。";
+            Refresh(*app);
+        }
         if (LOWORD(wp) == ResetButton) Reset(*app);
         if (LOWORD(wp) == SettingsButton) Settings(*app);
         if (LOWORD(wp) == AxesCommand) ToggleAxes(*app);
@@ -1220,14 +1383,15 @@ LRESULT CALLBACK MainProc(HWND window, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_DRAWITEM: {
         const auto& item = *reinterpret_cast<DRAWITEMSTRUCT*>(lp);
-        const bool main = item.CtlID == OpenButton;
+        const bool main = item.CtlID == OpenButton || item.CtlID == ConfirmButton;
         const bool pressed = (item.itemState & ODS_SELECTED) != 0;
         const bool disabled = (item.itemState & ODS_DISABLED) != 0;
         const auto fill = main ? (pressed ? RGB(88, 197, 226) : RGB(120, 218, 244))
                                : (pressed ? RGB(50, 69, 91) : RGB(34, 49, 69));
         SetDCBrushColor(item.hDC, fill);
         FillRect(item.hDC, &item.rcItem, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
-        const wchar_t* label = main ? L"開啟模型" : (item.CtlID == ResetButton ? L"重設視角" : L"設定");
+        const wchar_t* label = item.CtlID == OpenButton ? L"開啟模型" : item.CtlID == ConfirmButton ? L"仍要載入"
+                             : item.CtlID == CancelLoadButton ? L"取消" : item.CtlID == ResetButton ? L"重設視角" : L"設定";
         DrawTextLine(item.hDC, label, item.rcItem, app->bodyFont,
                      main ? Background : (disabled ? RGB(120, 140, 158) : Primary),
                      DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -1254,16 +1418,13 @@ LRESULT CALLBACK MainProc(HWND window, UINT msg, WPARAM wp, LPARAM lp) {
             const double dims[3] = {part ? part->size[0] : app->mesh.width, part ? part->size[1] : app->mesh.depth,
                                     part ? part->size[2] : app->mesh.height};
             // A unit stated in the file (3MF) wins over the setting.
-            const wchar_t* suffix = !app->fileUnit.empty() ? app->fileUnit.c_str() : Units[app->unit].suffix;
+            const wchar_t* suffix = UnitSuffix(*app);
             wchar_t metadata[240]{};
             swprintf_s(metadata, L"   |   %ls 個三角面   ·   X %.5g × Y %.5g × Z %.5g%ls",
                        Grouped(part ? part->count : app->faces).c_str(), dims[0], dims[1], dims[2], suffix);
             footer = app->filename + (part ? L" › " + part->name : std::wstring()) + metadata;
-            if (const double step = GridStep(*app); step > 0) {
-                wchar_t grid[64]{};
-                swprintf_s(grid, L"   ·   格線 %.5g%ls", step, suffix);
-                footer += grid;
-            }
+            if (const auto grid = GridFor(*app); grid.step > 0)
+                footer += L"   ·   格線 " + FormatLength(grid.step, EffectiveUnit(*app)) + suffix;
             footer += L"   ·   " + app->format;
             if (app->hasColor) footer += L"（含顏色資訊，未載入）";
             if (app->gpuModel) {

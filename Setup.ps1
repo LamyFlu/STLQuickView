@@ -23,6 +23,8 @@ $bindings = "SystemFileAssociations\.stl\ShellEx"
 $previewBinding = "$bindings\$previewType"
 $thumbnailBinding = "$bindings\$thumbnailType"
 $plateThumbnailBinding = ".3mf\ShellEx\$thumbnailType"
+# Preview pane for the other model formats, on the per-user extension keys.
+$extraPreviewBindings = '.3mf', '.obj', '.ply' | ForEach-Object { "$_\ShellEx\$previewType" }
 $installRoot = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'StlQuickView'
 $shortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'STL Quick View.lnk'
 
@@ -114,6 +116,7 @@ if ($Uninstall) {
     Remove-Binding $previewBinding $preview
     Remove-Binding $thumbnailBinding $thumbnail
     Remove-Binding $plateThumbnailBinding $plateThumbnail
+    foreach ($binding in $extraPreviewBindings) { Remove-Binding $binding $preview }
     Remove-Value $previewList $preview
     Remove-Value 'Software\RegisteredApplications' 'STL Quick View'
     Remove-Value "$classes\.stl\OpenWithProgids" $progId
@@ -179,6 +182,14 @@ if ($Thumbnails) {
     $user.DeleteSubKeyTree("$classes\CLSID\$plateThumbnail", $false)
 }
 Set-Value "$classes\$previewBinding" '' $preview
+foreach ($binding in $extraPreviewBindings) {
+    $existing = Get-Value $user "$classes\$binding"
+    if (-not $existing -or $existing -eq $preview) {
+        Set-Value "$classes\$binding" '' $preview
+    } else {
+        Write-Warning "A different per-user preview handler is already registered for $binding. It will be retained."
+    }
+}
 
 $link = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcut)
 $link.TargetPath = $exe

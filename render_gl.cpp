@@ -223,6 +223,10 @@ public:
         float rotation[4][4], transform[4][4];
         ViewMatrices(view, width, height, rotation, transform);
         glLoadMatrixf(&rotation[0][0]);   // row-major for row vectors == OpenGL column-major
+        // Model placement: p' = (p - offset) * scale, applied before the rotation.
+        glScalef(scene.scale, scene.scale, scene.scale);
+        glTranslatef(-scene.offset.x, -scene.offset.y, -scene.offset.z);
+        glEnable(GL_NORMALIZE);   // keep lighting correct under the uniform scale
 
         if (count > 0 && (vbo || !vertices.empty())) {
             glEnableClientState(GL_VERTEX_ARRAY);

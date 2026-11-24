@@ -3,12 +3,31 @@
 #include <windows.h>
 #include <cstdint>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace stl {
 constexpr size_t MaxBytes = 128ull * 1024 * 1024;
 constexpr size_t MaxFaces = 2'000'000;
+// Raised limits, used only after the user confirms loading an oversized model.
+constexpr size_t ExtendedBytes = 2048ull * 1024 * 1024;
+constexpr size_t ExtendedFaces = 30'000'000;
+
+struct Limits {
+    uint64_t bytes = MaxBytes;
+    size_t faces = MaxFaces;
+};
+inline constexpr Limits ExtendedLimits{ExtendedBytes, ExtendedFaces};
+
+// Thrown when a file exceeds the limits it is being loaded with.
+class TooLarge : public std::runtime_error {
+public:
+    TooLarge(const char* message, uint64_t faceCount, uint64_t byteCount)
+        : std::runtime_error(message), faces(faceCount), bytes(byteCount) {}
+    uint64_t faces;   // exact face count when known up front (binary STL), otherwise 0
+    uint64_t bytes;   // file size when the size was the reason, otherwise 0
+};
 
 struct Point { float x, y, z; };
 struct Triangle { Point a, b, c; };
@@ -41,7 +60,7 @@ struct StlInfo {
     std::vector<Solid> solids;
     bool color{};                                         // binary colour attributes present
 };
-Mesh Parse(std::span<const char> data, StlInfo* info = nullptr);
+Mesh Parse(std::span<const char> data, StlInfo* info = nullptr, Limits limits = {});
 // Validates the triangles, records size and centre, and rescales them to a unit diameter.
 void Normalize(Mesh& mesh);
 Palette ReadPalette();

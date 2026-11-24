@@ -115,14 +115,14 @@ void Normalize(Mesh& mesh) {
     if (!visible) throw std::runtime_error("這個模型沒有可顯示的表面。");
 }
 
-Mesh Parse(std::span<const char> data, StlInfo* info) {
+Mesh Parse(std::span<const char> data, StlInfo* info, Limits limits) {
     if (data.empty()) throw std::runtime_error("這個檔案是空的。");
-    if (data.size() > MaxBytes) throw std::runtime_error("STL 檔案超過 128 MiB。");
+    if (data.size() > limits.bytes) throw TooLarge("STL 檔案超過大小上限。", 0, data.size());
     Mesh mesh;
     uint32_t count{};
     if (data.size() >= 84) std::memcpy(&count, data.data() + 80, sizeof count);
     if (data.size() >= 84 && 84ull + 50ull * count == data.size()) {
-        if (count > MaxFaces) throw std::runtime_error("STL 超過 200 萬個三角面。");
+        if (count > limits.faces) throw TooLarge("STL 三角面數超過上限。", count, 0);
         mesh.triangles.resize(count);
         static_assert(sizeof(Triangle) == 36);
         for (size_t i = 0; i < count; ++i)
@@ -155,8 +155,7 @@ Mesh Parse(std::span<const char> data, StlInfo* info) {
                 const Triangle face{text.Vertex(), text.Vertex(), text.Vertex()};
                 text.Expect("endloop");
                 text.Expect("endfacet");
-                if (mesh.triangles.size() == MaxFaces)
-                    throw std::runtime_error("STL 超過 200 萬個三角面。");
+                if (mesh.triangles.size() >= limits.faces) throw TooLarge("STL 三角面數超過上限。", 0, 0);
                 mesh.triangles.push_back(face);
             }
             text.SkipLine();

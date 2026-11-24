@@ -16,6 +16,10 @@ constexpr GUID PreviewClsid{0x8fa42d75, 0x2473, 0x4d80, {0x93, 0xba, 0xd7, 0x3b,
 constexpr GUID ThumbnailClsid{0x7746619e, 0x43c9, 0x4fd6, {0x8a, 0xac, 0x78, 0x7e, 0x3f, 0x39, 0x8a, 0xb1}};
 constexpr GUID PlateThumbnailClsid{0xc3930db2, 0xad88, 0x4e7f, {0x92, 0x0b, 0x47, 0x54, 0x4e, 0x80, 0x5c, 0x39}};
 constexpr uint64_t ShellBytes = 64ull * 1024 * 1024;
+// A 3MF without a picture is rendered from its geometry, as long as it inflates to no more than this.
+constexpr uint64_t ThumbnailUnpacked = 256ull * 1024 * 1024;
+// Largest thumbnail we produce: pictures are never enlarged past their own size, renders stop here.
+constexpr UINT MaxPictureSide = 1024, MaxRenderSide = 512;
 constexpr stl::View Overview{0.65, 0.62};
 constexpr int Supersample = 2;
 // Explorer previews and thumbnails keep the light-blue model regardless of the viewer setting.
@@ -60,10 +64,19 @@ public:
         stream = nullptr;
     }
     IStream* Get() const { return stream; }
-    stl::Mesh Read() {
+    stl::Mesh Read() { return stl::Parse(ReadBytes(nullptr)); }
+
+    // Reads the whole stream. `name` receives the file name when the host provides one, so the
+    // format can be told from its extension.
+    std::vector<char> ReadBytes(std::wstring* name) {
         if (!stream) throw std::runtime_error("No stream.");
         STATSTG stat{};
-        if (FAILED(stream->Stat(&stat, STATFLAG_NONAME))) throw std::runtime_error("No stream size.");
+        if (FAILED(stream->Stat(&stat, name ? STATFLAG_DEFAULT : STATFLAG_NONAME)))
+            throw std::runtime_error("No stream size.");
+        if (stat.pwcsName) {
+            if (name) *name = stat.pwcsName;
+            CoTaskMemFree(stat.pwcsName);
+        }
         if (stat.cbSize.QuadPart > ShellBytes) throw std::length_error("Preview exceeds 64 MiB.");
         LARGE_INTEGER start{};
         if (FAILED(stream->Seek(start, STREAM_SEEK_SET, nullptr))) throw std::runtime_error("Unseekable STL.");
@@ -76,7 +89,7 @@ public:
                 received > requested) throw std::runtime_error("Incomplete STL stream.");
             offset += received;
         }
-        return stl::Parse(bytes);
+        return bytes;
     }
 private:
     IStream* stream{};
@@ -117,13 +130,19 @@ public:
     IFACEMETHODIMP DoPreview() override {
         if (!parent || window) return E_UNEXPECTED;
         error = nullptr;
+        caption.clear();
         try {
-            const auto mesh = input.Read();
-            frame = RenderOverview(mesh, 400, 0.86, false);
+            std::wstring name;
+            const auto bytes = input.ReadBytes(&name);
+            const auto model = model::Load(name, bytes);
+            frame = RenderOverview(model.mesh, 400, 0.86, false);
+            caption = Caption(model);
         } catch (const std::length_error&) {
             error = L"檔案超過 64 MiB，請用 STL Quick View 開啟。";
+        } catch (const stl::TooLarge&) {
+            error = L"模型超過 200 萬個三角面，請用 STL Quick View 開啟。";
         } catch (...) {
-            error = L"無法預覽這個 STL 檔案。";
+            error = L"無法預覽這個模型檔案。";
         }
         input.Clear();
         window = CreateWindowExW(0, L"STATIC", nullptr, WS_CHILD | WS_CLIPSIBLINGS,
@@ -203,14 +222,43 @@ private:
             client.top = std::max(0L, (client.bottom - textBounds.bottom) / 2);
             DrawTextW(dc, preview.error, -1, &client, wrap);
         } else {
-            const LONG side = std::min(client.right, client.bottom);
-            const LONG x = (client.right - side) / 2, y = (client.bottom - side) / 2;
+            // Model picture above, size caption below.
+            const UINT dpi = GetDpiForWindow(window);
+            const LONG captionHeight = preview.caption.empty() ? 0 : MulDiv(34, dpi ? dpi : 96, 96);
+            const LONG side = std::max(0L, std::min(client.right, client.bottom - captionHeight));
+            const LONG x = (client.right - side) / 2, y = std::max(0L, (client.bottom - captionHeight - side) / 2);
             const RECT output{x, y, x + side, y + side};
             SetStretchBltMode(dc, HALFTONE);
             stl::PaintFrame(dc, output, preview.frame);
+            if (captionHeight) {
+                const HFONT font = CreateFontW(-MulDiv(13, dpi ? dpi : 96, 96), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                               DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft JhengHei UI");
+                const auto previous = SelectObject(dc, font);
+                SetBkMode(dc, TRANSPARENT);
+                SetTextColor(dc, RGB(196, 214, 232));
+                RECT text{8, y + side, client.right - 8, std::min(client.bottom, y + side + captionHeight)};
+                DrawTextW(dc, preview.caption.c_str(), -1, &text,
+                          DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+                SelectObject(dc, previous);
+                DeleteObject(font);
+            }
         }
         EndPaint(window, &paint);
         return 0;
+    }
+
+    // "X 60 × Y 40 × Z 25", plus the unit only when the file states one (3MF), and the part count.
+    static std::wstring Caption(const model::Model& model) {
+        const auto number = [](double value) {
+            wchar_t text[32]{};
+            swprintf_s(text, L"%.4g", value);
+            return std::wstring(text);
+        };
+        const auto& mesh = model.mesh;
+        std::wstring caption = L"X " + number(mesh.width) + L" × Y " + number(mesh.depth) + L" × Z " +
+                               number(mesh.height) + model.unit;
+        if (model.parts.size() > 1) caption += L"   ·   " + std::to_wstring(model.parts.size()) + L" 個物件";
+        return caption;
     }
 
     Input input;
@@ -218,6 +266,7 @@ private:
     HWND parent{}, window{};
     RECT bounds{};
     stl::Frame frame;
+    std::wstring caption;
     const wchar_t* error{};
 };
 
@@ -232,8 +281,10 @@ HBITMAP ThumbnailBitmap(UINT width, UINT height, void** bits) {
     return CreateDIBSection(nullptr, &info, DIB_RGB_COLORS, bits, nullptr, 0);
 }
 
-HRESULT DecodePlateThumbnail(std::string& png, UINT side, HBITMAP* bitmap) {
-    if (png.empty()) return E_FAIL;
+// Decodes a PNG or JPEG package picture, trims its transparent margins so the model fills the
+// thumbnail, and scales it down to `side` (never up).
+HRESULT DecodePackagePicture(std::string& encoded, UINT side, HBITMAP* bitmap) {
+    if (encoded.empty()) return E_FAIL;
     using Microsoft::WRL::ComPtr;
     ComPtr<IWICImagingFactory> factory;
     ComPtr<IWICStream> stream;
@@ -242,9 +293,8 @@ HRESULT DecodePlateThumbnail(std::string& png, UINT side, HBITMAP* bitmap) {
     HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
     if (FAILED(hr)) return hr;
     if (FAILED(hr = factory->CreateStream(&stream)) ||
-        FAILED(hr = stream->InitializeFromMemory(reinterpret_cast<BYTE*>(png.data()), static_cast<DWORD>(png.size()))) ||
-        FAILED(hr = factory->CreateDecoder(GUID_ContainerFormatPng, &GUID_VendorMicrosoft, &decoder)) ||
-        FAILED(hr = decoder->Initialize(stream.Get(), WICDecodeMetadataCacheOnDemand)) ||
+        FAILED(hr = stream->InitializeFromMemory(reinterpret_cast<BYTE*>(encoded.data()), static_cast<DWORD>(encoded.size()))) ||
+        FAILED(hr = factory->CreateDecoderFromStream(stream.Get(), nullptr, WICDecodeMetadataCacheOnDemand, &decoder)) ||
         FAILED(hr = decoder->GetFrame(0, &frame))) return hr;
 
     UINT width{}, height{};
@@ -254,25 +304,69 @@ HRESULT DecodePlateThumbnail(std::string& png, UINT side, HBITMAP* bitmap) {
     if (FAILED(hr = factory->CreateFormatConverter(&converter)) ||
         FAILED(hr = converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppPBGRA,
             WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeCustom))) return hr;
-    IWICBitmapSource* pixels = converter.Get();
+
+    // Trim transparent margins: find the opaque content, keep a small border around it.
+    std::vector<uint32_t> pixels(size_t(width) * height);
+    if (FAILED(hr = converter->CopyPixels(nullptr, width * 4, UINT(pixels.size() * 4),
+                                          reinterpret_cast<BYTE*>(pixels.data())))) return hr;
+    UINT left = width, top = height, right = 0, bottom = 0;
+    for (UINT y = 0; y < height; ++y) {
+        const uint32_t* row = pixels.data() + size_t(y) * width;
+        for (UINT x = 0; x < width; ++x) {
+            if ((row[x] >> 24) <= 16) continue;
+            left = std::min(left, x);
+            right = std::max(right, x + 1);
+            top = std::min(top, y);
+            bottom = std::max(bottom, y + 1);
+        }
+    }
+    WICRect crop{0, 0, INT(width), INT(height)};
+    if (right > left && bottom > top) {
+        const UINT pad = std::max(2u, std::max(right - left, bottom - top) / 25);
+        crop.X = INT(left > pad ? left - pad : 0);
+        crop.Y = INT(top > pad ? top - pad : 0);
+        crop.Width = INT(std::min(width, right + pad)) - crop.X;
+        crop.Height = INT(std::min(height, bottom + pad)) - crop.Y;
+    }
+    IWICBitmapSource* source = converter.Get();
+    ComPtr<IWICBitmapClipper> clipper;
+    if (crop.Width < INT(width) || crop.Height < INT(height)) {
+        if (FAILED(hr = factory->CreateBitmapClipper(&clipper)) || FAILED(hr = clipper->Initialize(source, &crop)))
+            return hr;
+        source = clipper.Get();
+        width = UINT(crop.Width);
+        height = UINT(crop.Height);
+    }
+
     ComPtr<IWICBitmapScaler> scaler;
     const UINT edge = std::max(width, height);
     if (edge > side) {
         width = std::max(1u, width * side / edge);
         height = std::max(1u, height * side / edge);
         if (FAILED(hr = factory->CreateBitmapScaler(&scaler)) ||
-            FAILED(hr = scaler->Initialize(pixels, width, height, WICBitmapInterpolationModeFant))) return hr;
-        pixels = scaler.Get();
+            FAILED(hr = scaler->Initialize(source, width, height, WICBitmapInterpolationModeFant))) return hr;
+        source = scaler.Get();
     }
     void* bits{};
     const auto image = ThumbnailBitmap(width, height, &bits);
     if (!image) return E_OUTOFMEMORY;
-    hr = pixels->CopyPixels(nullptr, width * 4, width * height * 4, static_cast<BYTE*>(bits));
+    hr = source->CopyPixels(nullptr, width * 4, width * height * 4, static_cast<BYTE*>(bits));
     if (FAILED(hr)) {
         DeleteObject(image);
         return hr;
     }
     *bitmap = image;
+    return S_OK;
+}
+
+// Transparent, light-blue render of a mesh (STL thumbnails, and 3MF files without a picture).
+HRESULT RenderThumbnail(const stl::Mesh& mesh, UINT requested, HBITMAP* bitmap) {
+    const int side = static_cast<int>(std::min(requested, MaxRenderSide));
+    const auto frame = RenderOverview(mesh, side, 0.94, true);
+    void* bits{};
+    *bitmap = ThumbnailBitmap(UINT(frame.width), UINT(frame.height), &bits);
+    if (!*bitmap) return E_OUTOFMEMORY;
+    std::memcpy(bits, frame.pixels.data(), frame.pixels.size() * sizeof(uint32_t));
     return S_OK;
 }
 
@@ -299,20 +393,26 @@ public:
         try {
             if (firstPlate) {
                 if (!input.Get()) return E_UNEXPECTED;
-                auto png = model::ReadFirstPlateImage(*input.Get());
-                const auto result = DecodePlateThumbnail(png, std::min(requested, 256u), bitmap);
+                // The picture the slicer saved (first plate, or the package thumbnail)...
+                std::string picture;
+                try {
+                    picture = model::ReadFirstPlateImage(*input.Get(), std::min(requested, MaxPictureSide));
+                } catch (const std::runtime_error&) {
+                }
+                if (!picture.empty() &&
+                    SUCCEEDED(DecodePackagePicture(picture, std::min(requested, MaxPictureSide), bitmap))) {
+                    *alpha = WTSAT_ARGB;
+                    return S_OK;
+                }
+                // ...otherwise draw the model itself, as for STL.
+                const auto model = model::Load(L"thumbnail.3mf", input.ReadBytes(nullptr), ThumbnailUnpacked);
+                const auto result = RenderThumbnail(model.mesh, requested, bitmap);
                 if (SUCCEEDED(result)) *alpha = WTSAT_ARGB;
                 return result;
             }
-            const auto mesh = input.Read();
-            const int side = static_cast<int>(std::min(requested, 256u));
-            const auto frame = RenderOverview(mesh, side, 0.94, true);
-            void* bits{};
-            *bitmap = ThumbnailBitmap(side, side, &bits);
-            if (!*bitmap) return E_OUTOFMEMORY;
-            std::memcpy(bits, frame.pixels.data(), frame.pixels.size() * sizeof(uint32_t));
-            *alpha = WTSAT_ARGB;
-            return S_OK;
+            const auto result = RenderThumbnail(input.Read(), requested, bitmap);
+            if (SUCCEEDED(result)) *alpha = WTSAT_ARGB;
+            return result;
         } catch (const std::bad_alloc&) {
             return E_OUTOFMEMORY;
         } catch (...) {

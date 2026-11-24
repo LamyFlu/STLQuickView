@@ -26,6 +26,10 @@ struct Scene {
     stl::Point origin{};             // axis origin in model space
     float axisLength{};
     uint32_t first = 0, count = UINT32_MAX;   // vertex range to draw (one part, or everything)
+    // Model placement applied before the view: p' = (p - offset) * scale. Used to show one part
+    // on its own, centred and filling the view as if it had been opened alone.
+    stl::Point offset{};
+    float scale = 1;
 };
 
 class Renderer {
@@ -53,6 +57,8 @@ std::unique_ptr<Renderer> CreateOpenGL(HWND window, bool allowSoftware);
 // Row-major matrices for row vectors (p * M). `rotation` maps model to eye space (x right,
 // y up, z toward the viewer); `transform` maps model space to clip space with depth in [0, 1].
 void ViewMatrices(const stl::View& view, int width, int height, float rotation[4][4], float transform[4][4]);
+// ViewMatrices for a scene, with the scene's model placement folded into `transform`.
+void SceneMatrices(const Scene& scene, float rotation[4][4], float transform[4][4]);
 void Project(const float transform[4][4], stl::Point p, float clip[3]);
 
 // Top and bottom colours of the backdrop gradient.

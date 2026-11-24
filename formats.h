@@ -4,6 +4,7 @@
 // materials and textures are detected (for an on-screen notice) but never read.
 
 #include "mesh.h"
+#include <cstdint>
 #include <span>
 #include <string>
 #include <vector>
@@ -27,8 +28,15 @@ struct Model {
 };
 
 // Picks the format from the extension, falling back to the file signature.
-Model Load(const std::wstring& path, std::span<const char> bytes);
-std::string ReadFirstPlateImage(IStream& stream);
+// `maxUnpacked` caps the total bytes a 3MF may inflate to (0 = the viewer's 1 GiB default).
+// `limits` caps file size and face count; stl::TooLarge is thrown past them.
+Model Load(const std::wstring& path, std::span<const char> bytes, uint64_t maxUnpacked = 0,
+           stl::Limits limits = {});
+
+// Returns the encoded bytes (PNG or JPEG) of the picture a 3MF carries for its first plate or
+// for the whole package, or an empty string. Reads only the ZIP directory and that one image.
+// `requested` is the thumbnail size Explorer asked for; small sizes prefer a small picture.
+std::string ReadFirstPlateImage(IStream& stream, unsigned requested = 256);
 
 // File-dialog filter and the extensions the viewer accepts.
 inline constexpr wchar_t DialogFilter[] =

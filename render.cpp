@@ -31,6 +31,25 @@ void ViewMatrices(const stl::View& view, int width, int height, float rotation[4
     }
 }
 
+void SceneMatrices(const Scene& scene, float rotation[4][4], float transform[4][4]) {
+    float view[4][4];
+    ViewMatrices(scene.view, scene.width, scene.height, rotation, view);
+    // Placement rows (row vectors): scale on the diagonal, -offset * scale as translation.
+    const float s = scene.scale;
+    const float place[4][4] = {
+        {s, 0, 0, 0},
+        {0, s, 0, 0},
+        {0, 0, s, 0},
+        {-scene.offset.x * s, -scene.offset.y * s, -scene.offset.z * s, 1}};
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            float sum = 0;
+            for (int k = 0; k < 4; ++k) sum += place[i][k] * view[k][j];
+            transform[i][j] = sum;
+        }
+    }
+}
+
 void Project(const float m[4][4], stl::Point p, float clip[3]) {
     for (int j = 0; j < 3; ++j) clip[j] = p.x * m[0][j] + p.y * m[1][j] + p.z * m[2][j] + m[3][j];
 }
